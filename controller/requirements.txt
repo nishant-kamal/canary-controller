@@ -1,0 +1,9 @@
+# Kubernetes Python client — K8s API se baat karne ke liye
+kubernetes==28.1.0
+
+# HTTP requests — Prometheus queries ke liye
+requests==2.31.0
+
+# Logging (stdlib hai, but explicit rakhna achha hai)
+# urllib3 kubernetes ka dependency hai — version lock karo conflicts avoid karne ke liye
+urllib3>=1.26.0,<2.0.0
