@@ -1,0 +1,94 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Istio Traffic Management — Canary Controller
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# DO NOT manually edit weights — canary controller karta hai yeh kaam:
+#
+#   Initial state  → stable=100%  canary=0%
+#   Step 1         → stable=90%   canary=10%
+#   Step 2         → stable=70%   canary=30%
+#   Step 3         → stable=50%   canary=50%
+#   Step 4         → stable=20%   canary=80%
+#   Final/Rollback → stable=100%  canary=0%
+#
+# Apply karo:
+#   kubectl apply -f virtual-service.yaml
+#   kubectl get virtualservice myapp -o yaml   ← live weights dekho
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── DestinationRule ───────────────────────────────────────────────────────
+# Pods ko version label ke basis pe 2 subsets mein baantata hai.
+# Controller inhi subset names use karta hai: "stable" aur "canary"
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+    managed-by: canary-controller
+spec:
+  host: myapp     # Kubernetes Service ka naam (stable-deployment.yaml mein defined)
+
+  # ── Connection pool (optional but good practice) ──────────────────────
+  # Ek pod pe zyada connections na jaayein
+  trafficPolicy:
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    # Unhealthy pods ko automatically eject karo
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+
+  subsets:
+  - name: stable
+    labels:
+      version: v1     # myapp-stable pods (version: v1 label)
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+
+  - name: canary
+    labels:
+      version: v2     # myapp-canary pods (version: v2 label)
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+
+---
+# ─── VirtualService ────────────────────────────────────────────────────────
+# Traffic routing rules define karta hai.
+# canary_controller.py ka _set_traffic_split() sirf "weight" values patch karta hai.
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+    managed-by: canary-controller
+spec:
+  hosts:
+  - myapp     # cluster-internal traffic ke liye
+
+  http:
+  # ── Timeout & Retry (resilience) ────────────────────────────────────
+  - timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+      retryOn: "5xx,reset,connect-failure"   # sirf server errors pe retry
+
+    # ── Traffic weights ────────────────────────────────────────────────
+    # YEH CONTROLLER PATCH KARTA HAI — manually mat badlo
+    route:
+    - destination:
+        host: myapp
+        subset: stable
+      weight: 100   # initial: 100% stable
+
+    - destination:
+        host: myapp
+        subset: canary
+      weight: 0     # initial: 0% canary (controller badhaega)
