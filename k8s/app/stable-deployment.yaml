@@ -1,0 +1,109 @@
+# ─── Stable Deployment (v1) ───────────────────────────────────────────────
+# Production stable version.
+# Canary controller isko sirf tab update karta hai jab canary fully promote ho.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-stable
+  labels:
+    app: myapp
+    version: v1
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "Stable production version — managed by canary controller"
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: myapp
+      version: v1
+
+  # ── Rolling update strategy ──────────────────────────────────────────
+  # Update ke waqt zero downtime ensure karta hai
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1         # ek extra pod temporarily chalega update ke waqt
+      maxUnavailable: 0   # koi bhi pod down nahi hoga update ke dauran
+
+  template:
+    metadata:
+      labels:
+        app: myapp
+        version: v1       # ← Istio DestinationRule "stable" subset ise match karta hai
+      annotations:
+        prometheus.io/scrape: "true"   # Prometheus automatically metrics collect karega
+        prometheus.io/port: "80"
+
+    spec:
+      # ── Graceful shutdown ──────────────────────────────────────────────
+      # Pod band hone se pehle in-flight requests complete karne ka time
+      terminationGracePeriodSeconds: 30
+
+      containers:
+      - name: myapp
+        image: kennethreitz/httpbin:latest   # ← APNA IMAGE YAHAN LAGAO (e.g. your-repo/myapp:v1)
+        ports:
+        - containerPort: 80
+          name: http
+
+        # ── Resource limits ─────────────────────────────────────────────
+        # requests = pod schedule hone ke liye minimum guarantee
+        # limits   = isse zyada use nahi kar sakta
+        resources:
+          requests:
+            cpu: "100m"      # 0.1 CPU core
+            memory: "128Mi"
+          limits:
+            cpu: "200m"      # 0.2 CPU core
+            memory: "256Mi"
+
+        # ── Liveness Probe ──────────────────────────────────────────────
+        # Agar app hang ho jaye — Kubernetes pod restart kar deta hai
+        livenessProbe:
+          httpGet:
+            path: /get        # httpbin ka health endpoint
+            port: 80
+          initialDelaySeconds: 15   # pod start hone ke baad kitna wait karo
+          periodSeconds: 20         # har 20s mein check
+          failureThreshold: 3       # 3 baar fail ho to restart
+
+        # ── Readiness Probe ─────────────────────────────────────────────
+        # Jab tak yeh pass na ho — pod ko traffic nahi milega
+        # Canary rollout ke liye critical hai
+        readinessProbe:
+          httpGet:
+            path: /get
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+
+        # ── Environment variables ────────────────────────────────────────
+        env:
+        - name: APP_VERSION
+          value: "v1"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name    # logs mein pod name aayega
+
+---
+# ─── Kubernetes Service ────────────────────────────────────────────────────
+# Stable aur canary dono pods ko yeh service cover karti hai.
+# Istio VirtualService traffic split iske upar kaam karta hai.
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+spec:
+  selector:
+    app: myapp        # version label nahi — dono v1 aur v2 match karta hai
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    protocol: TCP
