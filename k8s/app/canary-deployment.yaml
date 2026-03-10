@@ -1,0 +1,89 @@
+# ─── Canary Deployment (v2) ───────────────────────────────────────────────
+# Naya release deploy karne ke liye yeh file apply karo.
+# Controller automatically detect karega aur canary lifecycle shuru kar dega:
+#   10% → 30% → 50% → 80% → 100% (ya rollback agar metrics kharab ho)
+#
+# Usage:
+#   kubectl apply -f canary-deployment.yaml
+#   kubectl logs -f deployment/canary-controller
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-canary
+  labels:
+    app: myapp
+    version: v2
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    canary: "true"
+    description: "Canary release — auto-managed by canary controller"
+
+spec:
+  replicas: 1           # sirf 1 replica — Istio weight se traffic control hota hai
+
+  selector:
+    matchLabels:
+      app: myapp
+      version: v2
+
+  # Recreate — canary sirf 1 replica hai, rolling update ki zaroorat nahi
+  strategy:
+    type: Recreate
+
+  template:
+    metadata:
+      labels:
+        app: myapp
+        version: v2     # Istio DestinationRule "canary" subset ise match karta hai
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+        rollout-timestamp: "2026-02-16T00:00:00Z"   # deploy time — update karo har release pe
+
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      containers:
+      - name: myapp
+        image: kennethreitz/httpbin:latest   # NAYA IMAGE YAHAN (your-repo/myapp:v2)
+        ports:
+        - containerPort: 80
+          name: http
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+
+        # ── Liveness Probe ──────────────────────────────────────────────
+        # Hang ho jaye to Kubernetes restart kar deta hai
+        livenessProbe:
+          httpGet:
+            path: /get
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          failureThreshold: 3
+
+        # ── Readiness Probe ─────────────────────────────────────────────
+        # CRITICAL: jab tak ready na ho, controller traffic shift nahi karega
+        # canary_controller.py ka _wait_for_canary_ready() yahi check karta hai
+        readinessProbe:
+          httpGet:
+            path: /get
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+
+        # ── Environment variables ────────────────────────────────────────
+        env:
+        - name: APP_VERSION
+          value: "v2"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
