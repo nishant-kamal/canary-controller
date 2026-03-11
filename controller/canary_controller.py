@@ -9,6 +9,12 @@ Flow:
   2. Traffic gradually badhaao (10 → 30 → 50 → 80 → 100)
   3. Har step pe Prometheus metrics check karo
   4. Unhealthy? → Rollback. Healthy? → Promote.
+
+Fixes applied:
+  - TimeoutError now caught in run() → returns ROLLEDBACK gracefully
+  - _set_traffic_split uses read-modify-write to preserve timeout/retry config
+  - get_error_rate failure now treated as unhealthy (None → rollback)
+  - _finalize_promotion looks up container by name, not index [0]
 """
 
 import time
@@ -28,19 +34,23 @@ logger = logging.getLogger(__name__)
 # ─── Thresholds (tune karo experiments ke liye) ────────────────────────────
 ERROR_RATE_THRESHOLD  = 0.05   # 5%  — isse zyada 5xx → rollback
 LATENCY_P99_THRESHOLD = 500    # ms  — isse zyada latency → rollback
-EVALUATION_WINDOW_SEC = 30     # har step ke baad kitne seconds wait karo
+EVALUATION_WINDOW_SEC = 120    # FIX: 30s → 120s; matches PromQL "2m" window
 TRAFFIC_STEPS         = [10, 30, 50, 80, 100]  # canary traffic %
 
+# ─── Container name for the main app container ────────────────────────────
+# FIX: use name-based lookup instead of containers[0] assumption
+APP_CONTAINER_NAME = "app"  # change if your container has a different name
+
 # ─── Result codes ──────────────────────────────────────────────────────────
-PROMOTED  = "PROMOTED"
+PROMOTED   = "PROMOTED"
 ROLLEDBACK = "ROLLEDBACK"
 NOT_FOUND  = "NOT_FOUND"
 
 
 @dataclass
 class HealthSnapshot:
-    error_rate: float
-    latency_p99: float
+    error_rate: Optional[float]   # None = metrics unavailable
+    latency_p99: Optional[float]  # None = metrics unavailable
     is_healthy: bool
     reason: str
 
@@ -85,7 +95,15 @@ class CanaryController:
         # Step 0: canary shuru karo 0% pe (stable chal raha hai abhi bhi)
         self._set_traffic_split(app_name, namespace, canary_pct=0)
         logger.info("⏳  Canary pods ready hone ka wait...")
-        self._wait_for_canary_ready(app_name, namespace)
+
+        # FIX: TimeoutError catch karo — crash nahi, ROLLEDBACK return karo
+        try:
+            self._wait_for_canary_ready(app_name, namespace)
+        except TimeoutError as e:
+            logger.error(f"⏰  {e}")
+            logger.error("🚨  Canary pods ready nahi hue — rolling back.")
+            self._rollback(app_name, namespace)
+            return ROLLEDBACK
 
         # Step loop: 10 → 30 → 50 → 80 → 100
         for step, canary_pct in enumerate(TRAFFIC_STEPS):
@@ -113,20 +131,28 @@ class CanaryController:
                 self._finalize_promotion(app_name, namespace)
                 return PROMOTED
 
-        return PROMOTED  # should not reach here
+        # Should never reach here; loop always hits canary_pct == 100 first
+        return PROMOTED
 
     # ──────────────────────────────────────────────────────────────────────
     # HEALTH EVALUATION
     # ──────────────────────────────────────────────────────────────────────
 
     def _evaluate_health(self, app_name: str) -> HealthSnapshot:
+        # FIX: treat None (metrics unavailable) as unhealthy — fail safe
         error_rate  = self.metrics.get_error_rate(app_name, "canary")
         latency_p99 = self.metrics.get_p99_latency(app_name, "canary")
 
         issues = []
-        if error_rate > ERROR_RATE_THRESHOLD:
+
+        if error_rate is None:
+            issues.append("error_rate=UNAVAILABLE (Prometheus unreachable — treating as unhealthy)")
+        elif error_rate > ERROR_RATE_THRESHOLD:
             issues.append(f"error_rate={error_rate:.2%} > threshold={ERROR_RATE_THRESHOLD:.2%}")
-        if latency_p99 > LATENCY_P99_THRESHOLD:
+
+        if latency_p99 is None:
+            issues.append("latency_p99=UNAVAILABLE (Prometheus unreachable — treating as unhealthy)")
+        elif latency_p99 > LATENCY_P99_THRESHOLD:
             issues.append(f"p99={latency_p99:.0f}ms > threshold={LATENCY_P99_THRESHOLD}ms")
 
         is_healthy = len(issues) == 0
@@ -136,9 +162,11 @@ class CanaryController:
 
     def _log_health(self, h: HealthSnapshot, canary_pct: int):
         status = "✅ HEALTHY" if h.is_healthy else "❌ UNHEALTHY"
+        error_str   = f"{h.error_rate:.2%}"   if h.error_rate   is not None else "N/A"
+        latency_str = f"{h.latency_p99:.0f}ms" if h.latency_p99 is not None else "N/A"
         logger.info(
             f"{status} | canary={canary_pct}% | "
-            f"error_rate={h.error_rate:.2%} | p99_latency={h.latency_p99:.0f}ms"
+            f"error_rate={error_str} | p99_latency={latency_str}"
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -146,30 +174,45 @@ class CanaryController:
     # ──────────────────────────────────────────────────────────────────────
 
     def _set_traffic_split(self, app_name: str, namespace: str, canary_pct: int):
-        """Istio VirtualService ka weight update karo."""
-        patch = {
-            "spec": {
-                "http": [{
-                    "route": [
-                        {
-                            "destination": {"host": app_name, "subset": "stable"},
-                            "weight": 100 - canary_pct
-                        },
-                        {
-                            "destination": {"host": app_name, "subset": "canary"},
-                            "weight": canary_pct
-                        }
-                    ]
-                }]
-            }
-        }
+        """
+        Istio VirtualService ka weight update karo.
+
+        FIX: Read-modify-write pattern — existing timeout/retry/fault config
+        preserve hoga. Pehle wala approach (direct patch) poora http[0] object
+        replace kar deta tha aur timeout/retries silently delete ho jaate the.
+        """
+        try:
+            vs = self.custom_api.get_namespaced_custom_object(
+                group="networking.istio.io",
+                version="v1alpha3",
+                namespace=namespace,
+                plural="virtualservices",
+                name=app_name,
+            )
+        except ApiException as e:
+            logger.error(f"VirtualService read failed: {e.reason}")
+            raise
+
+        # Sirf weights update karo — baaki config (timeout, retries) untouched
+        http_rules = vs.get("spec", {}).get("http", [])
+        if not http_rules:
+            raise ValueError(f"VirtualService '{app_name}' mein koi http rule nahi mila")
+
+        route = http_rules[0].get("route", [])
+        for destination_entry in route:
+            subset = destination_entry.get("destination", {}).get("subset")
+            if subset == "stable":
+                destination_entry["weight"] = 100 - canary_pct
+            elif subset == "canary":
+                destination_entry["weight"] = canary_pct
+
         self.custom_api.patch_namespaced_custom_object(
             group="networking.istio.io",
             version="v1alpha3",
             namespace=namespace,
             plural="virtualservices",
             name=app_name,
-            body=patch
+            body=vs,
         )
 
     def _rollback(self, app_name: str, namespace: str):
@@ -190,20 +233,41 @@ class CanaryController:
         logger.info("✅  Rollback complete. System stable.")
 
     def _finalize_promotion(self, app_name: str, namespace: str):
-        """Canary image ko stable mein promote karo, canary pod hata do."""
+        """
+        Canary image ko stable mein promote karo, canary pod hata do.
+
+        FIX: container name se image lookup karo, index[0] nahi.
+        Multi-container pods (e.g., with sidecars) ke liye safe.
+        """
         logger.info("🔁  Finalizing: updating stable with canary image...")
 
-        # Canary ka image lo
-        canary_dep  = self.apps_v1.read_namespaced_deployment(
+        canary_dep = self.apps_v1.read_namespaced_deployment(
             name=f"{app_name}-canary", namespace=namespace
         )
-        canary_image = canary_dep.spec.template.spec.containers[0].image
 
-        # Stable ka image update karo
+        # FIX: named container lookup
+        canary_image = self._get_container_image(canary_dep, APP_CONTAINER_NAME)
+        if canary_image is None:
+            # Fallback: use containers[0] but log a warning
+            logger.warning(
+                f"Container '{APP_CONTAINER_NAME}' not found in canary pod spec. "
+                f"Falling back to containers[0]. Set APP_CONTAINER_NAME correctly."
+            )
+            canary_image = canary_dep.spec.template.spec.containers[0].image
+
         stable_dep = self.apps_v1.read_namespaced_deployment(
             name=f"{app_name}-stable", namespace=namespace
         )
-        stable_dep.spec.template.spec.containers[0].image = canary_image
+
+        # Update matching container in stable, or containers[0] as fallback
+        updated = self._set_container_image(stable_dep, APP_CONTAINER_NAME, canary_image)
+        if not updated:
+            logger.warning(
+                f"Container '{APP_CONTAINER_NAME}' not found in stable pod spec. "
+                f"Falling back to containers[0]."
+            )
+            stable_dep.spec.template.spec.containers[0].image = canary_image
+
         self.apps_v1.patch_namespaced_deployment(
             name=f"{app_name}-stable", namespace=namespace, body=stable_dep
         )
@@ -215,6 +279,21 @@ class CanaryController:
             body=client.V1DeleteOptions(grace_period_seconds=5)
         )
         logger.info("🗑  Canary deployment removed. Promotion complete.")
+
+    def _get_container_image(self, deployment, container_name: str) -> Optional[str]:
+        """Named container ka image return karo, ya None if not found."""
+        for c in deployment.spec.template.spec.containers:
+            if c.name == container_name:
+                return c.image
+        return None
+
+    def _set_container_image(self, deployment, container_name: str, image: str) -> bool:
+        """Named container ka image set karo. Returns True if found and updated."""
+        for c in deployment.spec.template.spec.containers:
+            if c.name == container_name:
+                c.image = image
+                return True
+        return False
 
     def _canary_exists(self, app_name: str, namespace: str) -> bool:
         try:
@@ -235,7 +314,7 @@ class CanaryController:
             dep = self.apps_v1.read_namespaced_deployment(
                 name=f"{app_name}-canary", namespace=namespace
             )
-            ready = dep.status.ready_replicas or 0
+            ready   = dep.status.ready_replicas or 0
             desired = dep.spec.replicas or 1
             if ready >= desired:
                 logger.info(f"✅  Canary pods ready ({ready}/{desired})")
