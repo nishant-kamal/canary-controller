@@ -6,12 +6,15 @@ Environment variables se configure hota hai — hardcode kuch nahi.
 Usage (local testing):
     IN_CLUSTER=false APP_NAME=myapp python main.py
 
-Usage (Kubernetes pod mein):
-    ENV vars ConfigMap/Deployment se inject hote hain.
+Usage (Kubernetes Job mein):
+    ENV vars ConfigMap se inject hote hain.
 
 Fix applied:
-  - Writes /tmp/controller.pid on startup for the liveness probe.
-    (Old probe only checked if libraries were importable — not useful.)
+  - Writes /tmp/controller.pid on startup AND touches it before every
+    evaluation step (via touch_pid callback passed to CanaryController).
+    Previously the file was written once and never updated, so a hanging
+    process (e.g., stuck in time.sleep) would keep passing the liveness
+    probe indefinitely. Now the probe detects stalls within ~90s.
 """
 
 import os
@@ -25,8 +28,12 @@ logger = logging.getLogger(__name__)
 PID_FILE = "/tmp/controller.pid"
 
 
-def write_pid():
-    """Liveness probe ke liye PID file likho."""
+def touch_pid():
+    """
+    Liveness probe ke liye PID file touch karo (mtime update).
+    Startup pe aur har evaluation step se pehle call hota hai.
+    Agar process hang ho jaye to file stale ho jaayegi aur probe fail kar dega.
+    """
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -45,8 +52,10 @@ def main():
     logger.info(f"  IN_CLUSTER : {in_cluster}")
     logger.info("=" * 55)
 
-    # FIX: PID file likho — liveness probe isse check karta hai
-    write_pid()
+    # FIX: touch_pid() called on startup AND passed as callback so
+    # CanaryController touches it before each sleep — liveness probe
+    # will detect a hung process within (periodSeconds * failureThreshold) = 90s.
+    touch_pid()
     logger.info(f"📝  PID file written: {PID_FILE}")
 
     # ── Prometheus health check ────────────────────────────────────────
@@ -59,7 +68,7 @@ def main():
 
     # ── Run controller ─────────────────────────────────────────────────
     controller = CanaryController(in_cluster=in_cluster)
-    result = controller.run(app_name=app_name, namespace=namespace)
+    result = controller.run(app_name=app_name, namespace=namespace, heartbeat=touch_pid)
 
     # ── Exit codes (CI/CD pipeline ke liye useful) ─────────────────────
     if result == PROMOTED:

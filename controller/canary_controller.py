@@ -15,12 +15,16 @@ Fixes applied:
   - _set_traffic_split uses read-modify-write to preserve timeout/retry config
   - get_error_rate failure now treated as unhealthy (None → rollback)
   - _finalize_promotion looks up container by name, not index [0]
+  - run() accepts optional heartbeat callback → touches PID file before each
+    sleep so the liveness probe detects a hung process (not just startup)
+  - _evaluate_health guards against zero traffic — skips health judgment when
+    no requests have been seen yet, avoiding false rollbacks at ramp-up
 """
 
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from metrics_client import MetricsClient
@@ -36,6 +40,12 @@ ERROR_RATE_THRESHOLD  = 0.05   # 5%  — isse zyada 5xx → rollback
 LATENCY_P99_THRESHOLD = 500    # ms  — isse zyada latency → rollback
 EVALUATION_WINDOW_SEC = 120    # FIX: 30s → 120s; matches PromQL "2m" window
 TRAFFIC_STEPS         = [10, 30, 50, 80, 100]  # canary traffic %
+
+# FIX: minimum requests/sec before health is evaluated.
+# If no traffic has reached the canary yet (e.g. load generator not started),
+# PromQL returns empty → None → would trigger a false rollback.
+# Guard: skip health judgment when request rate is below this threshold.
+MIN_REQUEST_RATE = 0.1  # req/s — tune if your load is lower
 
 # ─── Container name for the main app container ────────────────────────────
 # FIX: use name-based lookup instead of containers[0] assumption
@@ -77,9 +87,17 @@ class CanaryController:
     # PUBLIC ENTRY POINT
     # ──────────────────────────────────────────────────────────────────────
 
-    def run(self, app_name: str, namespace: str = "default") -> str:
+    def run(self, app_name: str, namespace: str = "default",
+            heartbeat: Optional[Callable] = None) -> str:
         """
         Canary controller ka main loop.
+
+        Args:
+            app_name:  Kubernetes app name (deployment prefix).
+            namespace: Kubernetes namespace.
+            heartbeat: Optional zero-arg callable invoked before each
+                       time.sleep() — used to touch the liveness PID file
+                       so a hung process is detected by the probe.
 
         Returns:
             "PROMOTED"    → canary successfully 100% pe aa gaya
@@ -113,6 +131,10 @@ class CanaryController:
             self._set_traffic_split(app_name, namespace, canary_pct)
             logger.info(f"🔀  VirtualService updated: stable={100-canary_pct}% canary={canary_pct}%")
 
+            # FIX: touch PID file before sleeping so liveness probe detects hangs
+            if heartbeat:
+                heartbeat()
+
             # Wait karo metrics stable hone tak
             logger.info(f"⏱  {EVALUATION_WINDOW_SEC}s wait kar raha hoon metrics ke liye...")
             time.sleep(EVALUATION_WINDOW_SEC)
@@ -139,6 +161,18 @@ class CanaryController:
     # ──────────────────────────────────────────────────────────────────────
 
     def _evaluate_health(self, app_name: str) -> HealthSnapshot:
+        # FIX: guard against zero traffic — if no requests have reached the
+        # canary yet (load generator not started, traffic not shifted yet),
+        # PromQL returns empty → None, which would trigger a false rollback.
+        # Skip health judgment and treat as healthy until traffic flows.
+        request_rate = self.metrics.get_request_rate(app_name, "canary")
+        if request_rate is None or request_rate < MIN_REQUEST_RATE:
+            logger.warning(
+                f"⚠  Request rate too low ({request_rate} req/s < {MIN_REQUEST_RATE}) "
+                f"— insufficient traffic to evaluate health. Treating as healthy, will re-check next step."
+            )
+            return HealthSnapshot(None, None, is_healthy=True, reason="INSUFFICIENT_TRAFFIC (skipping)")
+
         # FIX: treat None (metrics unavailable) as unhealthy — fail safe
         error_rate  = self.metrics.get_error_rate(app_name, "canary")
         latency_p99 = self.metrics.get_p99_latency(app_name, "canary")
