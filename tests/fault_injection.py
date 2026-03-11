@@ -37,14 +37,14 @@ spec:
           value: 50.0
         httpStatus: 500
     route:
-    - destination:
-        host: myapp
-        subset: canary
-      weight: 100
-    - destination:
-        host: myapp
-        subset: stable
-      weight: 0
+      - destination:
+          host: myapp
+          subset: canary
+        weight: 100
+      - destination:
+          host: myapp
+          subset: stable
+        weight: 0
 """,
     },
     "E2": {
@@ -65,14 +65,14 @@ spec:
           value: 100.0
         fixedDelay: 2s
     route:
-    - destination:
-        host: myapp
-        subset: canary
-      weight: 100
-    - destination:
-        host: myapp
-        subset: stable
-      weight: 0
+      - destination:
+          host: myapp
+          subset: canary
+        weight: 100
+      - destination:
+          host: myapp
+          subset: stable
+        weight: 0
 """,
     },
     "E3": {
@@ -107,14 +107,14 @@ spec:
   - myapp
   http:
   - route:
-    - destination:
-        host: myapp
-        subset: stable
-      weight: 100
-    - destination:
-        host: myapp
-        subset: canary
-      weight: 0
+      - destination:
+          host: myapp
+          subset: stable
+        weight: 100
+      - destination:
+          host: myapp
+          subset: canary
+        weight: 0
 """
     kubectl_apply_inline(restore_yaml)
     logger.info("✅  Fault removed, VirtualService restored.")
