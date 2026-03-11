@@ -4,8 +4,8 @@
 #
 # Apply order:
 #   1. ServiceAccount
-#   2. ClusterRole
-#   3. ClusterRoleBinding
+#   2. Role  (FIX: was ClusterRole — scoped to namespace now)
+#   3. RoleBinding  (FIX: was ClusterRoleBinding)
 #   4. ConfigMap
 #   5. Deployment
 #
@@ -14,8 +14,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ─── 1. ServiceAccount ────────────────────────────────────────────────────
-# Controller pod is identity se chal raha hai
-# K8s API calls is account ke naam pe hoti hain
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -23,22 +21,26 @@ metadata:
   namespace: default
   labels:
     app: canary-controller
-automountServiceAccountToken: true   # controller ko K8s API access chahiye
+automountServiceAccountToken: true
 
 ---
-# ─── 2. ClusterRole ───────────────────────────────────────────────────────
-# Principle of Least Privilege — sirf wahi permissions jo zaruri hain
+# ─── 2. Role (namespace-scoped) ───────────────────────────────────────────
+# FIX: ClusterRole → Role
+# Controller sirf "default" namespace mein kaam karta hai — cluster-wide
+# permissions unnecessary aur insecure the. Role least-privilege enforce karta hai.
 #
 # Permission breakdown:
 #   deployments (get/list)   → canary exist karta hai check karna
 #   deployments (patch)      → stable ka image update karna (promotion)
 #   deployments (delete)     → canary deployment hataana (rollback/promotion)
-#   virtualservices (get)    → current weights padhna
+#   virtualservices (get)    → read-modify-write ke liye current state padhna
 #   virtualservices (patch)  → traffic weights update karna
+#   pods (get/list)          → readiness check ke liye
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: canary-controller-role
+  namespace: default
   labels:
     app: canary-controller
 rules:
@@ -51,18 +53,18 @@ rules:
   resources: ["virtualservices"]
   verbs: ["get", "patch"]
 
-# Pod status dekhne ke liye (readiness check)
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list"]
 
 ---
-# ─── 3. ClusterRoleBinding ────────────────────────────────────────────────
-# ServiceAccount ko ClusterRole se bind karta hai
+# ─── 3. RoleBinding (namespace-scoped) ────────────────────────────────────
+# FIX: ClusterRoleBinding → RoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: canary-controller-binding
+  namespace: default
   labels:
     app: canary-controller
 subjects:
@@ -70,13 +72,12 @@ subjects:
   name: canary-controller
   namespace: default
 roleRef:
-  kind: ClusterRole
+  kind: Role
   name: canary-controller-role
   apiGroup: rbac.authorization.k8s.io
 
 ---
 # ─── 4. ConfigMap ─────────────────────────────────────────────────────────
-# Controller config — yahan se tune karo, Dockerfile rebuild ki zarurat nahi
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -116,12 +117,10 @@ spec:
       labels:
         app: canary-controller
       annotations:
-        prometheus.io/scrape: "false"   # controller khud monitored nahi hoga
+        prometheus.io/scrape: "false"
 
     spec:
       serviceAccountName: canary-controller
-
-      # Controller restart hone pe turant wapas aaye
       restartPolicy: Always
 
       containers:
@@ -129,13 +128,10 @@ spec:
         image: YOUR_REGISTRY/canary-controller:v1   # ← APNA IMAGE (docker push ke baad)
         imagePullPolicy: Always
 
-        # ── Config from ConfigMap ──────────────────────────────────────
         envFrom:
         - configMapRef:
             name: canary-controller-config
 
-        # ── Resources ─────────────────────────────────────────────────
-        # Controller lightweight hai — sirf API calls karta hai
         resources:
           requests:
             cpu: "50m"
@@ -145,15 +141,16 @@ spec:
             memory: "128Mi"
 
         # ── Liveness probe ────────────────────────────────────────────
-        # Agar controller hang ho jaye to pod restart ho
+        # FIX: pehle wala probe sirf import check karta tha — process alive
+        # nahi check karta tha. Ab main.py process ka PID file check hoga.
+        # main.py startup pe /tmp/controller.pid likhta hai (see main.py).
         livenessProbe:
           exec:
-            command: ["python", "-c", "import kubernetes; import requests"]
+            command: ["test", "-f", "/tmp/controller.pid"]
           initialDelaySeconds: 20
           periodSeconds: 30
           failureThreshold: 3
 
-      # ── Security context ──────────────────────────────────────────────
       securityContext:
-        runAsNonRoot: true      # root ke roop mein nahi chalega
+        runAsNonRoot: true
         runAsUser: 1000
