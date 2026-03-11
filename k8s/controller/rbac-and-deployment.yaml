@@ -1,16 +1,23 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# Canary Controller — RBAC + Deployment
+# Canary Controller — RBAC + Job
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Apply order:
 #   1. ServiceAccount
-#   2. Role  (FIX: was ClusterRole — scoped to namespace now)
-#   3. RoleBinding  (FIX: was ClusterRoleBinding)
+#   2. Role  (namespace-scoped, least-privilege)
+#   3. RoleBinding
 #   4. ConfigMap
-#   5. Deployment
+#   5. Job  (FIX: was Deployment — controller is run-once, not a daemon.
+#             Deployment + restartPolicy:Always caused a restart loop when
+#             no canary was deployed: NOT_FOUND → exit 2 → restart → repeat)
 #
-# kubectl apply -f rbac-and-deployment.yaml
-# kubectl rollout status deployment/canary-controller
+# Usage:
+#   # Deploy canary image first, then trigger a fresh controller run:
+#   kubectl apply -f rbac-and-deployment.yaml          # first-time setup
+#   kubectl delete job canary-controller --ignore-not-found
+#   kubectl apply -f rbac-and-deployment.yaml
+#
+#   kubectl logs -f job/canary-controller
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ─── 1. ServiceAccount ────────────────────────────────────────────────────
@@ -25,9 +32,8 @@ automountServiceAccountToken: true
 
 ---
 # ─── 2. Role (namespace-scoped) ───────────────────────────────────────────
-# FIX: ClusterRole → Role
 # Controller sirf "default" namespace mein kaam karta hai — cluster-wide
-# permissions unnecessary aur insecure the. Role least-privilege enforce karta hai.
+# permissions unnecessary aur insecure hain. Role least-privilege enforce karta hai.
 #
 # Permission breakdown:
 #   deployments (get/list)   → canary exist karta hai check karna
@@ -35,7 +41,10 @@ automountServiceAccountToken: true
 #   deployments (delete)     → canary deployment hataana (rollback/promotion)
 #   virtualservices (get)    → read-modify-write ke liye current state padhna
 #   virtualservices (patch)  → traffic weights update karna
-#   pods (get/list)          → readiness check ke liye
+#
+# FIX: pods (get/list) removed — _wait_for_canary_ready uses
+#   read_namespaced_deployment (not pod listing), so this permission was
+#   declared but never used. Removed to enforce least-privilege.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -52,10 +61,6 @@ rules:
 - apiGroups: ["networking.istio.io"]
   resources: ["virtualservices"]
   verbs: ["get", "patch"]
-
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list"]
 
 ---
 # ─── 3. RoleBinding (namespace-scoped) ────────────────────────────────────
@@ -92,9 +97,20 @@ data:
   PROMETHEUS_URL: "http://prometheus-operated.monitoring.svc.cluster.local:9090"
 
 ---
-# ─── 5. Controller Deployment ─────────────────────────────────────────────
-apiVersion: apps/v1
-kind: Deployment
+# ─── 5. Controller Job ────────────────────────────────────────────────────
+# FIX: Deployment → Job
+#
+# The controller is run-once: it runs the full canary lifecycle (PROMOTED /
+# ROLLEDBACK / NOT_FOUND) and exits. Using a Deployment with
+# restartPolicy:Always caused an infinite restart loop when no canary was
+# deployed — NOT_FOUND → exit 2 → Kubernetes restarts pod → repeat.
+#
+# With a Job (backoffLimit:0), the pod runs exactly once per apply.
+# To trigger a new canary run:
+#   kubectl delete job canary-controller --ignore-not-found
+#   kubectl apply -f rbac-and-deployment.yaml
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: canary-controller
   namespace: default
@@ -103,14 +119,8 @@ metadata:
   annotations:
     description: "Metrics-driven canary controller — BITS Dissertation 2024MT03065"
 spec:
-  replicas: 1     # sirf 1 — multiple controllers ek saath chalenge to conflict hoga
-
-  selector:
-    matchLabels:
-      app: canary-controller
-
-  strategy:
-    type: Recreate    # controller restart hone pe purana band ho pehle
+  backoffLimit: 0       # no retries — a failed run means rollback already happened
+  ttlSecondsAfterFinished: 600   # auto-cleanup job 10 min after completion
 
   template:
     metadata:
@@ -121,7 +131,7 @@ spec:
 
     spec:
       serviceAccountName: canary-controller
-      restartPolicy: Always
+      restartPolicy: Never    # Job semantics — never restart on exit
 
       containers:
       - name: controller
@@ -141,9 +151,10 @@ spec:
             memory: "128Mi"
 
         # ── Liveness probe ────────────────────────────────────────────
-        # FIX: pehle wala probe sirf import check karta tha — process alive
-        # nahi check karta tha. Ab main.py process ka PID file check hoga.
-        # main.py startup pe /tmp/controller.pid likhta hai (see main.py).
+        # FIX: PID file is now touched every evaluation step (see main.py),
+        # not just written once at startup. A hanging process will stop
+        # updating the file and the probe will fail → Kubernetes kills
+        # and the Job records failure (no silent hang).
         livenessProbe:
           exec:
             command: ["test", "-f", "/tmp/controller.pid"]
