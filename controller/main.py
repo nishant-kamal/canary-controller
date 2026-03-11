@@ -8,6 +8,10 @@ Usage (local testing):
 
 Usage (Kubernetes pod mein):
     ENV vars ConfigMap/Deployment se inject hote hain.
+
+Fix applied:
+  - Writes /tmp/controller.pid on startup for the liveness probe.
+    (Old probe only checked if libraries were importable — not useful.)
 """
 
 import os
@@ -17,6 +21,14 @@ from canary_controller import CanaryController, PROMOTED, ROLLEDBACK, NOT_FOUND
 from metrics_client import MetricsClient
 
 logger = logging.getLogger(__name__)
+
+PID_FILE = "/tmp/controller.pid"
+
+
+def write_pid():
+    """Liveness probe ke liye PID file likho."""
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
 
 
 def main():
@@ -32,6 +44,10 @@ def main():
     logger.info(f"  NAMESPACE  : {namespace}")
     logger.info(f"  IN_CLUSTER : {in_cluster}")
     logger.info("=" * 55)
+
+    # FIX: PID file likho — liveness probe isse check karta hai
+    write_pid()
+    logger.info(f"📝  PID file written: {PID_FILE}")
 
     # ── Prometheus health check ────────────────────────────────────────
     mc = MetricsClient()
