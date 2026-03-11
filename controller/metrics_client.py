@@ -6,6 +6,11 @@ Istio ke sidecar proxies se metrics fetch karta hai via Prometheus.
 Istio automatically yeh metrics expose karta hai:
   - istio_requests_total        → request count by status code
   - istio_request_duration_*    → latency histogram
+
+Fix applied:
+  - get_error_rate / get_p99_latency ab None return karte hain on failure,
+    0.0 nahi. Controller is None ko "unhealthy" treat karta hai — agar
+    Prometheus down ho to canary silently promote nahi hoga.
 """
 
 import logging
@@ -29,10 +34,13 @@ class MetricsClient:
     # PUBLIC METHODS
     # ──────────────────────────────────────────────────────────────────────
 
-    def get_error_rate(self, app: str, version: str, window: str = "2m") -> float:
+    def get_error_rate(self, app: str, version: str, window: str = "2m") -> Optional[float]:
         """
         5xx error rate return karta hai (0.0 to 1.0).
         Example: 0.07 = 7% requests fail ho rahe hain.
+
+        FIX: Returns None if Prometheus is unreachable or returns no data.
+        Caller (CanaryController) treats None as unhealthy — fail-safe behavior.
 
         PromQL logic:
           5xx requests ka rate / total requests ka rate
@@ -51,14 +59,20 @@ class MetricsClient:
         """
         result = self._instant_query(promql)
         if result is None:
-            logger.warning(f"Error rate query failed for {app}/{version}, defaulting to 0.0")
-            return 0.0
+            logger.warning(
+                f"Error rate query failed for {app}/{version}. "
+                f"Returning None — controller will treat this as unhealthy."
+            )
+            return None
         return float(result)
 
-    def get_p99_latency(self, app: str, version: str, window: str = "2m") -> float:
+    def get_p99_latency(self, app: str, version: str, window: str = "2m") -> Optional[float]:
         """
         P99 latency milliseconds mein return karta hai.
         Example: 342.5 = 99% requests 342ms se kam mein complete hue.
+
+        FIX: Returns None if Prometheus is unreachable or returns no data.
+        Caller (CanaryController) treats None as unhealthy — fail-safe behavior.
 
         PromQL logic:
           Istio request duration histogram se 99th percentile nikalna.
@@ -73,14 +87,18 @@ class MetricsClient:
         """
         result = self._instant_query(promql)
         if result is None:
-            logger.warning(f"Latency query failed for {app}/{version}, defaulting to 0.0")
-            return 0.0
+            logger.warning(
+                f"Latency query failed for {app}/{version}. "
+                f"Returning None — controller will treat this as unhealthy."
+            )
+            return None
         return float(result)
 
-    def get_success_rate(self, app: str, version: str, window: str = "2m") -> float:
+    def get_success_rate(self, app: str, version: str, window: str = "2m") -> Optional[float]:
         """
         2xx success rate (0.0 to 1.0).
         Dissertation charts ke liye useful.
+        Returns None on failure.
         """
         promql = f"""
             sum(rate(istio_requests_total{{
@@ -95,10 +113,10 @@ class MetricsClient:
             }}[{window}]))
         """
         result = self._instant_query(promql)
-        return float(result) if result is not None else 0.0
+        return float(result) if result is not None else None
 
-    def get_request_rate(self, app: str, version: str, window: str = "2m") -> float:
-        """Requests per second — traffic load verify karne ke liye."""
+    def get_request_rate(self, app: str, version: str, window: str = "2m") -> Optional[float]:
+        """Requests per second — traffic load verify karne ke liye. Returns None on failure."""
         promql = f"""
             sum(rate(istio_requests_total{{
                 destination_app="{app}",
@@ -106,7 +124,7 @@ class MetricsClient:
             }}[{window}]))
         """
         result = self._instant_query(promql)
-        return float(result) if result is not None else 0.0
+        return float(result) if result is not None else None
 
     def health_check(self) -> bool:
         """Prometheus reachable hai ya nahi check karo."""
